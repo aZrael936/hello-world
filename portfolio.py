@@ -2,18 +2,20 @@
 
 from calculator import (
     calc_position_size,
-    calc_liquidation_price,
+    calc_liquidation_isolated,
     calc_liquidation_cross,
+    calc_mmr,
     calc_pnl,
     calc_pnl_at_tp,
     calc_risk_reward,
+    get_mmf,
 )
 
 
 class Trade:
     _next_id = 1
 
-    def __init__(self, symbol, side, mode, entry_price, tp_price, margin, leverage):
+    def __init__(self, symbol, side, mode, entry_price, tp_price, margin, leverage, mmf=None):
         self.id = Trade._next_id
         Trade._next_id += 1
         self.symbol = symbol.upper()
@@ -25,6 +27,7 @@ class Trade:
         self.leverage = leverage
         self.position_size = margin * leverage
         self.qty = self.position_size / entry_price
+        self.mmf = mmf if mmf is not None else get_mmf(symbol)
         self.is_open = True
         self.realized_pnl = 0.0
 
@@ -37,6 +40,11 @@ class Trade:
         return calc_pnl_at_tp(
             self.entry_price, self.tp_price, self.margin, self.leverage, self.side
         )
+
+    def maintenance_margin_req(self, price=None):
+        """MMR for this position at a given price (defaults to entry)."""
+        price = price or self.entry_price
+        return calc_mmr(self.qty, price, self.mmf)
 
     def to_dict(self, current_price=None):
         pnl_tp, roi_tp = self.pnl_at_tp()
@@ -51,6 +59,7 @@ class Trade:
             "leverage": self.leverage,
             "size": self.position_size,
             "qty": self.qty,
+            "mmf": self.mmf,
             "pnl_at_tp": pnl_tp,
             "roi_at_tp": roi_tp,
             "open": self.is_open,
@@ -64,7 +73,7 @@ class Trade:
 class Portfolio:
     def __init__(self, balance):
         self.initial_balance = balance
-        self.balance = balance          # available + margin in trades
+        self.balance = balance
         self.realized_pnl = 0.0
         self.trades = []
 
@@ -93,8 +102,8 @@ class Portfolio:
     def available_balance(self):
         return self.total_balance - self.total_margin_used
 
-    def add_trade(self, symbol, side, mode, entry_price, tp_price, risk_pct, leverage):
-        """Add a new trade. Returns the Trade object or raises ValueError."""
+    def add_trade(self, symbol, side, mode, entry_price, tp_price, risk_pct, leverage, mmf=None):
+        """Add a new trade using risk %. Returns the Trade object or raises ValueError."""
         margin, position_size = calc_position_size(self.total_balance, risk_pct, leverage)
 
         if margin > self.available_balance:
@@ -103,11 +112,11 @@ class Portfolio:
                 f"${self.available_balance:.2f} available."
             )
 
-        trade = Trade(symbol, side, mode, entry_price, tp_price, margin, leverage)
+        trade = Trade(symbol, side, mode, entry_price, tp_price, margin, leverage, mmf)
         self.trades.append(trade)
         return trade
 
-    def add_trade_fixed_margin(self, symbol, side, mode, entry_price, tp_price, margin, leverage):
+    def add_trade_fixed_margin(self, symbol, side, mode, entry_price, tp_price, margin, leverage, mmf=None):
         """Add trade with a fixed margin amount instead of risk %."""
         if margin > self.available_balance:
             raise ValueError(
@@ -115,7 +124,7 @@ class Portfolio:
                 f"${self.available_balance:.2f} available."
             )
 
-        trade = Trade(symbol, side, mode, entry_price, tp_price, margin, leverage)
+        trade = Trade(symbol, side, mode, entry_price, tp_price, margin, leverage, mmf)
         self.trades.append(trade)
         return trade
 
@@ -131,26 +140,49 @@ class Portfolio:
         self.realized_pnl += pnl
         return pnl
 
-    def get_liquidation_price(self, trade_id):
-        """Get liquidation price for a specific trade."""
+    def _calc_mmr_other(self, exclude_trade_id, prices=None):
+        """
+        Calculate total maintenance margin requirement from all OTHER open positions.
+        Used for cross-margin liquidation price (MMR_o in the dYdX formula).
+        Uses current prices if available, otherwise entry prices.
+        """
+        mmr_o = 0
+        for t in self.open_trades:
+            if t.id == exclude_trade_id:
+                continue
+            price = t.entry_price
+            if prices and t.symbol in prices:
+                price = prices[t.symbol]
+            mmr_o += t.maintenance_margin_req(price)
+        return mmr_o
+
+    def get_liquidation_price(self, trade_id, prices=None):
+        """
+        Get liquidation price for a specific trade using dYdX formulas.
+
+        Isolated: p' = (e - s*p) / (|s|*MMF - s)
+            where e = trade margin
+
+        Cross: p' = (e - s*p - MMR_o) / (|s|*MMF - s)
+            where e = total account equity, MMR_o = MMR from other positions
+        """
         trade = self._get_trade(trade_id)
 
         if trade.mode == "isolated":
-            return calc_liquidation_price(
-                trade.entry_price, trade.leverage, trade.side, "isolated"
+            return calc_liquidation_isolated(
+                trade.entry_price, trade.qty, trade.side, trade.margin, trade.mmf
             )
         else:
-            # Cross margin: available balance (minus other isolated margins) backs this
-            available = self.available_balance
+            mmr_o = self._calc_mmr_other(trade.id, prices)
             return calc_liquidation_cross(
-                trade.entry_price, trade.leverage, trade.side,
-                trade.margin, available
+                trade.entry_price, trade.qty, trade.side,
+                self.total_balance, trade.mmf, mmr_o
             )
 
-    def get_trade_summary(self, trade_id, current_price=None):
+    def get_trade_summary(self, trade_id, current_price=None, prices=None):
         """Full summary for one trade."""
         trade = self._get_trade(trade_id)
-        liq = self.get_liquidation_price(trade_id)
+        liq = self.get_liquidation_price(trade_id, prices)
         rr = calc_risk_reward(trade.entry_price, trade.tp_price, liq, trade.side)
 
         d = trade.to_dict(current_price)
@@ -160,7 +192,7 @@ class Portfolio:
         if trade.mode == "isolated":
             d["max_loss"] = trade.margin
         else:
-            d["max_loss"] = self.total_balance  # cross can wipe balance
+            d["max_loss"] = self.total_balance
         return d
 
     def portfolio_summary(self, prices=None):
@@ -173,7 +205,7 @@ class Portfolio:
 
         for trade in self.open_trades:
             cp = prices.get(trade.symbol) if prices else None
-            summary = self.get_trade_summary(trade.id, cp)
+            summary = self.get_trade_summary(trade.id, cp, prices)
             if cp is not None:
                 total_unrealized += summary.get("unrealized_pnl", 0)
             trade_summaries.append(summary)
@@ -196,13 +228,13 @@ class Portfolio:
     def rebalance_summary(self, prices=None):
         """
         Recalculate all cross-margin liquidation prices after portfolio changes.
-        This is called automatically — cross positions share margin, so adding/removing
-        a trade changes liquidation prices for all cross positions.
+        Cross positions share margin so adding/removing a trade changes
+        liquidation prices for all cross positions.
         """
         results = []
         for trade in self.open_trades:
             if trade.mode == "cross":
-                new_liq = self.get_liquidation_price(trade.id)
+                new_liq = self.get_liquidation_price(trade.id, prices)
                 cp = prices.get(trade.symbol) if prices else None
                 results.append({
                     "id": trade.id,
