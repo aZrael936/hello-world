@@ -2,7 +2,7 @@
 """Crypto Trading Risk Calculator — Interactive CLI."""
 
 import sys
-from calculator import quick_calculate
+from calculator import quick_calculate, get_mmf, DEFAULT_MMF, FALLBACK_MMF
 from portfolio import Portfolio
 from prices import fetch_prices, fetch_price_single, get_supported_symbols
 
@@ -116,10 +116,12 @@ def display_calc_result(result):
     divider("Calculation Result")
     side_str = green("LONG") if result["side"] == "long" else red("SHORT")
     mode_str = yellow("CROSS") if result["mode"] == "cross" else cyan("ISOLATED")
+    mmf_pct = result.get("mmf", 0) * 100
 
     print(f"  Side: {side_str}  |  Mode: {mode_str}  |  Leverage: {result['leverage']}x")
     print(f"  Entry Price:       {fmt_usd(result['entry_price'])}")
     print(f"  Take Profit:       {fmt_usd(result['tp_price'])}")
+    print(f"  Maint. Margin:     {mmf_pct:.1f}%  (dYdX MMF)")
     print()
     print(f"  Margin (Risk):     {fmt_usd(result['margin'])}")
     print(f"  Position Size:     {fmt_usd(result['position_size'])}")
@@ -138,7 +140,8 @@ def display_trade(summary):
     mode_str = yellow("CROSS") if summary["mode"] == "cross" else cyan("ISOLATED")
     status = green("OPEN") if summary["open"] else red("CLOSED")
 
-    print(f"  #{summary['id']} {summary['symbol']} {side_str} {mode_str} {summary['leverage']}x  [{status}]")
+    mmf_pct = summary.get("mmf", 0) * 100
+    print(f"  #{summary['id']} {summary['symbol']} {side_str} {mode_str} {summary['leverage']}x  [{status}]  MMF:{mmf_pct:.0f}%")
     print(f"     Entry: {fmt_usd(summary['entry'])}  |  TP: {fmt_usd(summary['tp'])}")
     print(f"     Margin: {fmt_usd(summary['margin'])}  |  Size: {fmt_usd(summary['size'])}  |  Qty: {summary['qty']:.6f}")
 
@@ -335,6 +338,15 @@ def action_portfolio_summary(portfolio, cached_prices):
 
 def action_quick_calc(portfolio):
     divider("Quick Risk Calculator")
+    symbol = input("  Symbol (e.g. BTC, ETH — or press Enter to skip): ").strip().upper()
+    default_mmf = get_mmf(symbol) if symbol else FALLBACK_MMF
+    print(f"  Default MMF for {symbol or 'unknown'}: {default_mmf * 100:.1f}%")
+    custom_mmf = input_float(
+        f"  Maintenance margin % (Enter for {default_mmf * 100:.1f}%): ",
+        min_val=0.1, max_val=100, allow_empty=True
+    )
+    mmf = (custom_mmf / 100) if custom_mmf is not None else default_mmf
+
     balance = input_float("  Balance ($): ", min_val=0.01)
     risk_pct = input_float("  Risk (% of balance): ", min_val=0.01, max_val=100)
     leverage = input_float("  Leverage: ", min_val=1, max_val=200)
@@ -343,7 +355,7 @@ def action_quick_calc(portfolio):
     side = input_choice("  Side (long/short): ", ["long", "short"])
     mode = input_choice("  Margin mode (isolated/cross): ", ["isolated", "cross"])
 
-    result = quick_calculate(balance, risk_pct, leverage, entry_price, tp_price, side, mode)
+    result = quick_calculate(balance, risk_pct, leverage, entry_price, tp_price, side, mode, mmf)
     display_calc_result(result)
 
 
